@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Iterator
 
 from docx import Document as DocxDocumentFile
 from docx.document import Document as DocxDocument
@@ -17,6 +18,9 @@ from backend.config import get_settings
 from backend.services.llm import get_embedding_model
 
 logger = logging.getLogger(__name__)
+
+INDEX_SCHEMA_VERSION = "v3_section_chunking"
+MIN_CHUNK_CHARS = 180
 
 
 def _get_doc_path() -> str:
@@ -46,7 +50,7 @@ def collection_is_empty(vectorstore: Chroma) -> bool:
     return vectorstore._collection.count() == 0
 
 
-def _iter_docx_blocks(doc: DocxDocument):
+def _iter_docx_blocks(doc: DocxDocument) -> Iterator[Paragraph | Table]:
     for child in doc.element.body.iterchildren():
         if isinstance(child, CT_P):
             yield Paragraph(child, doc)
@@ -54,37 +58,86 @@ def _iter_docx_blocks(doc: DocxDocument):
             yield Table(child, doc)
 
 
+def _normalize_whitespace(text: str) -> str:
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
 def _table_to_text(table: Table) -> str:
     rows = []
     for row in table.rows:
-        cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+        cells = [_normalize_whitespace(cell.text) for cell in row.cells if _normalize_whitespace(cell.text)]
         if cells:
             rows.append(" | ".join(cells))
     return "\n".join(rows)
 
 
+def _flush_section(
+    documents: list[Document],
+    source_path: str,
+    heading_stack: list[str],
+    body_parts: list[str],
+    section_index: int,
+) -> int:
+    section_text = _normalize_whitespace("\n\n".join(body_parts))
+    if not section_text:
+        return section_index
+
+    heading_path = " > ".join(heading_stack) if heading_stack else os.path.basename(source_path)
+    section_title = heading_stack[-1] if heading_stack else os.path.basename(source_path)
+
+    documents.append(
+        Document(
+            page_content=section_text,
+            metadata={
+                "source": source_path,
+                "file_type": "docx",
+                "section_index": section_index,
+                "section_title": section_title,
+                "heading_path": heading_path,
+            },
+        )
+    )
+    return section_index + 1
+
+
 def _load_docx_documents(path: str) -> list[Document]:
     doc = DocxDocumentFile(path)
-    blocks: list[str] = []
+    source_path = _normalize_source_path(path)
+    documents: list[Document] = []
+    heading_stack: list[str] = []
+    body_parts: list[str] = []
+    section_index = 0
 
     for block in _iter_docx_blocks(doc):
         if isinstance(block, Paragraph):
-            text = block.text.strip()
-        else:
-            text = _table_to_text(block)
+            text = _normalize_whitespace(block.text)
+            if not text:
+                continue
 
-        if text:
-            blocks.append(text)
+            style_name = getattr(block.style, "name", "")
+            if style_name.startswith("Heading"):
+                section_index = _flush_section(documents, source_path, heading_stack, body_parts, section_index)
+                body_parts = []
 
-    if not blocks:
-        return []
+                try:
+                    level = int(style_name.split()[-1])
+                except (ValueError, IndexError):
+                    level = 1
 
-    return [
-        Document(
-            page_content="\n\n".join(blocks),
-            metadata={"source": _normalize_source_path(path), "file_type": "docx"},
-        )
-    ]
+                heading_stack = heading_stack[: level - 1]
+                heading_stack.append(text)
+                continue
+
+            body_parts.append(text)
+            continue
+
+        table_text = _table_to_text(block)
+        if table_text:
+            body_parts.append(table_text)
+
+    _flush_section(documents, source_path, heading_stack, body_parts, section_index)
+    return documents
 
 
 def _load_json_documents(path: str) -> list[Document]:
@@ -139,8 +192,38 @@ def _load_source_documents(path: str) -> list[Document]:
     raise ValueError(f"Unsupported data file type: {extension}. Supported types are .docx and .json.")
 
 
+def _build_splitter() -> RecursiveCharacterTextSplitter:
+    settings = get_settings()
+    return RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", "؟ ", "! ", ". ", "، ", " "],
+        keep_separator="end",
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+    )
+
+
 def _build_chunk_ids(source_hash: str, chunk_count: int) -> list[str]:
-    return [f"{source_hash}:{index}" for index in range(chunk_count)]
+    return [f"{INDEX_SCHEMA_VERSION}:{source_hash}:{index}" for index in range(chunk_count)]
+
+
+def _merge_small_chunks(chunks: list[Document]) -> list[Document]:
+    if not chunks:
+        return chunks
+
+    merged: list[Document] = []
+
+    for chunk in chunks:
+        if (
+            merged
+            and len(chunk.page_content) < MIN_CHUNK_CHARS
+            and merged[-1].metadata.get("heading_path") == chunk.metadata.get("heading_path")
+        ):
+            merged[-1].page_content = f"{merged[-1].page_content}\n{chunk.page_content}".strip()
+            continue
+
+        merged.append(chunk)
+
+    return merged
 
 
 def _annotate_chunks(chunks: list[Document], source_path: str, source_hash: str) -> list[Document]:
@@ -150,6 +233,7 @@ def _annotate_chunks(chunks: list[Document], source_path: str, source_hash: str)
             "source_path": source_path,
             "source_hash": source_hash,
             "chunk_index": index,
+            "index_schema_version": INDEX_SCHEMA_VERSION,
         }
     return chunks
 
@@ -180,24 +264,24 @@ def ingest_document() -> None:
         logger.warning("No documents extracted from %s - skipping.", source_path)
         return
 
-    settings = get_settings()
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-    )
+    splitter = _build_splitter()
     chunks = splitter.split_documents(documents)
+    chunks = _merge_small_chunks(chunks)
     chunks = _annotate_chunks(chunks, source_path=source_path, source_hash=source_hash)
     chunk_ids = _build_chunk_ids(source_hash=source_hash, chunk_count=len(chunks))
 
     existing = _get_existing_source_chunks(vectorstore, source_path=source_path)
     existing_ids = existing.get("ids", [])
-    existing_hashes = {
-        metadata.get("source_hash")
+    existing_pairs = {
+        (
+            metadata.get("source_hash"),
+            metadata.get("index_schema_version"),
+        )
         for metadata in existing.get("metadatas", [])
-        if metadata and metadata.get("source_hash")
+        if metadata
     }
 
-    if set(existing_ids) == set(chunk_ids) and existing_hashes == {source_hash}:
+    if set(existing_ids) == set(chunk_ids) and existing_pairs == {(source_hash, INDEX_SCHEMA_VERSION)}:
         logger.info("Source file unchanged - skipping ingestion for %s.", source_path)
         return
 

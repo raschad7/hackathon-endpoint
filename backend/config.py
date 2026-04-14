@@ -8,8 +8,11 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
     doc_filename: str = "data.docx"
     collection_name: str = "rag_collection"
-    chunk_size: int = 1000
-    chunk_overlap: int = 200
+    chunk_size: int = 850
+    chunk_overlap: int = 120
+    retrieval_k: int = 3
+    retrieval_fetch_k: int = 9
+    source_excerpt_chars: int = 360
     llm_model: str = "gpt-4o"
     embedding_model: str = "text-embedding-ada-002"
 
@@ -22,7 +25,7 @@ class Settings(BaseSettings):
         "1. ALWAYS respond in Arabic, regardless of the language of the question. "
         "2. ONLY use information from the provided context to answer. Do not make up information. "
         "3. If the context does not contain enough information to answer, respond with: "
-        "'عذراً، لا تتوفر لدي معلومات كافية للإجابة على هذا السؤال. يرجى التواصل مع بلدية الخليل مباشرة.' "
+        "عذراً، لا تتوفر لدي معلومات كافية للإجابة على هذا السؤال. "
         "4. Be professional, clear, and concise. "
         "5. If the question is not related to Hebron Municipality or its services, politely redirect "
         "the user by saying this assistant is specialized for Hebron Municipality inquiries only. "
